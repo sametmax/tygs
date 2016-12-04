@@ -12,7 +12,7 @@ from aiohttp.web_reqrep import Request
 from aiohttp.web import RequestHandlerFactory, RequestHandler
 import werkzeug
 
-from .utils import ensure_coroutine, HTTP_VERBS
+from .utils import ensure_coroutine, HTTP_VERBS, DebugException
 from .http.server import HttpRequestController, Router
 from .exceptions import HttpResponseControllerError
 
@@ -121,7 +121,7 @@ class HttpComponent(Component):
 
             @wraps(func)
             async def handler_wrapper(req, res):
-                if not lazy_body:
+                if req.expect_body and req.body.is_present and not lazy_body:
                     await req.load_body()
                 return await func(req, res)
 
@@ -133,15 +133,13 @@ class HttpComponent(Component):
         return decorator
 
     def on_error(self, code, lazy_body=False):
+
         def decorator(func):
 
             func = ensure_coroutine(func)
 
             @wraps(func)
             async def handler_wrapper(req, res):
-
-                if not lazy_body and req._aiohttp_request.has_body:
-                    await req.load_body()
                 return await func(req, res)
 
             # TODO: allow passing explicit endpoint
@@ -194,7 +192,7 @@ class AioHttpRequestHandlerAdapter(RequestHandler):
 
         try:
             await handler(req, req.response)
-        except Exception:
+        except Exception as e:
             # TODO: provide a debug web page and disable this
             # on prod
             handler = await self._router.get_error_handler(500)
@@ -207,6 +205,21 @@ class AioHttpRequestHandlerAdapter(RequestHandler):
             resp.context['error_details'] = tb
             # logging.error(e, exc_info=True)
             await handler(req, resp)
+
+            return e
+
+    async def handle_error(self, status=500, message=None,
+                           payload=None, exc=None, headers=None, reason=None):
+
+            # keep aiohttp behavior when the exception is
+            # errors.HttpProcessingError since it's part of the HTTP
+            # workflow
+            if headers is not None:
+                return await super().handle_error(status, message, payload,
+                                                  exc, headers, reason)
+
+            # else we do nothing and let it the behavior in
+            # _call_request_handler take precendence
 
     async def handle_request(self, message, payload):
         if self.access_log:
@@ -230,7 +243,7 @@ class AioHttpRequestHandlerAdapter(RequestHandler):
         ############
 
         ###############
-        await self._call_request_handler(tygs_request, handler)
+        exception = await self._call_request_handler(tygs_request, handler)
 
         ###############
 
@@ -239,6 +252,12 @@ class AioHttpRequestHandlerAdapter(RequestHandler):
 
         response = tygs_request.response
         resp_msg = await self._write_response_to_client(tygs_request, response)
+
+        if exception is not None and self.tygs_app.fail_fast_mode:
+            # we still return the response because we have to (i.e. our tests
+            # depends on an HTTP response)
+            # import pdb; pdb.set_trace()
+            raise DebugException(exception)
 
         # for repr
         self._meth = 'none'

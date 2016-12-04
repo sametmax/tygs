@@ -4,15 +4,18 @@ import asyncio
 
 from textwrap import dedent
 
+import http.cookies
+
 from aiohttp.web_reqrep import Response
 from aiohttp.helpers import reify
+from multidict import CIMultiDict
 
 from werkzeug.routing import Map, Rule
 
 from tygs.exceptions import (HttpRequestControllerError,
                              HttpResponseControllerError,
                              RoutingError)
-from tygs.utils import HTTP_VERBS, removable_property
+from tygs.utils import HTTP_VERBS
 
 
 # TODO: move this function and other renderers to a dedicated module
@@ -40,10 +43,66 @@ def no_renderer(response):
     """.format(response.request.handler, response)))
 
 
+class HttpBody(CIMultiDict):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_loaded = False
+        self.is_present = False
+
+    def fail_on_body_no_loaded(self):
+        if self.is_present and not self.is_loaded:
+
+            raise HttpRequestControllerError(dedent("""
+                You must await "HttpRequestController.load_body()" before
+                accessing "HttpRequestController.body" mapping.
+
+                This error can happen when you read "req.body['something']" or
+                "req['something']" (because it looks up in "req.body"
+                after "req.query_args").
+
+                "HttpRequestController.load_body()" is called automatically
+                unless you used "lazy_body=True" in your routing code, so
+                check it out.
+            """))
+
+    def __repr__(self):
+
+        if self.is_present:
+            if self.is_loaded:
+                return super().__repr__().replace('CIMultiDict',
+                                                  'HttpBody')
+            else:
+                return "<HttpBody [body in request but not loaded]>"
+        else:
+            return "<HttpBody [no body in request]>"
+
+
+# inject test guarding against accessing an not loaded body
+# in all the data manipulation methods
+for method_name in ('__getitem__', '__iter__', 'items', 'keys', 'values',
+                    '__len__', 'copy', 'getone', 'getall', 'get',
+                    'pop', 'popitem', 'setdefault'):
+
+    # small hack with a closure to ensure the method name is stored with
+    # the function
+    def closure():
+        name = method_name
+
+        def method(self, *args, **kwargs):
+            self.fail_on_body_no_loaded()
+            return getattr(super(HttpBody, self), name)(*args, **kwargs)
+        return method
+
+    setattr(HttpBody, method_name, closure())
+
+
+# TODO : remove "Controller" is this name
 class HttpRequestController:
 
     # TODO: decouple aiothttp_request from HttpRequestController
     # TODO: decouple httprequestcontroller from httprequest
+    # TODO: make an alternative constructor called from_aiothttp_request
     def __init__(self, app, aiohttp_request):
         self.app = app
         self._aiohttp_request = aiohttp_request
@@ -52,7 +111,10 @@ class HttpRequestController:
         self.script_name = None  # TODO : figure out what script name does
         self.subdomain = None  # TODO: figure out subdomain handling
         self.method = aiohttp_request.method
+        self.expect_body = self.method in ('POST', 'PATCH', 'PUT')
         self.response = HttpResponseController(self)
+        self.body = HttpBody()
+        self.body.is_present = aiohttp_request.has_body
 
         # TODO: check if we can improve the user experience with the multidict
         # API (avoid the confusion of when getting multiple values, etc)
@@ -82,25 +144,26 @@ class HttpRequestController:
         except KeyError:
             pass
 
-        try:
-            return self.body[name]
-        except HttpRequestControllerError as e:
-            raise HttpRequestControllerError(dedent("""
-                When you call HttpRequestController.__getitem__() (e.g: when
-                you do req['something']), it implicitly tries to access
-                HttpRequestController.body.
+        if self.body.is_present:
+            try:
+                return self.body[name]
+            except HttpRequestControllerError as e:
+                raise HttpRequestControllerError(dedent("""
+                    When you call HttpRequestController.__getitem__() (e.g:
+                    when you do req['something']), it implicitly tries to
+                    access HttpRequestController.body.
 
-                If you see this error, it means you did it but you didn't call
-                HttpRequestController.load_body() before, which is necessary
-                to load and parse the request body.
+                    If you see this error, it means you did it but you didn't
+                    call HttpRequestController.load_body() before, which is
+                    necessary to load and parse the request body.
 
-                HttpRequestController.load_body is called automatically
-                unless you used "lazy_body=True" in your routing code,
-                so check it out.
-                it out.
-                """)) from e
-        except KeyError as e:
-            pass
+                    HttpRequestController.load_body is called automatically
+                    unless you used "lazy_body=True" in your routing code,
+                    so check it out.
+                    it out.
+                    """)) from e
+            except KeyError as e:
+                pass
 
         try:
             return self.cookies[name]
@@ -166,24 +229,10 @@ class HttpRequestController:
     def url_query(self):
         return self._aiohttp_request.GET
 
-    @removable_property
-    def body(self):
-        raise HttpRequestControllerError(dedent("""
-            You must await "HttpRequestController.load_body()" before accessing
-            "HttpRequestController.body".
-
-            This error can happen when you read "req.body" or
-            "req['something']" (because it looks up in "req.body"
-            after "req.query_args").
-
-            "HttpRequestController.load_body()" is called automatically unless
-            you used "lazy_body=True" in your routing code, so check it out.
-        """))
-
     async def load_body(self):
-        body = await self._aiohttp_request.post()
-        self.body = body
-        return body
+        self.body.update(await self._aiohttp_request.post())
+        self.body.is_loaded = True
+        return self.body
 
 
 # TODO: send log info about multidict values: the user should know if she tries
@@ -208,6 +257,7 @@ class HttpResponseController:
         self.reason = "OK"
         self.charset = "utf-8"
         self.headers = {}
+        self._cookies = http.cookies.SimpleCookie()
 
     def __repr__(self):
         req = self.request
@@ -223,6 +273,16 @@ class HttpResponseController:
 
         # Do not try super().__getattr__ since the parent doesn't define it.
         raise object.__getattribute__(self, name)
+
+    def set_cookie(self, *args, **kwargs):  # TODO: be a little less lazy
+        return Response.set_cookie(self, *args, **kwargs)
+
+    def del_cookie(self, *args, **kwargs):  # TODO: be a little less lazy
+        return Response.del_cookie(self, *args, **kwargs)
+
+    @property
+    def cookies(self):
+        return self._cookies
 
     # TODO: allow template engine to be passed here as a parameter, but
     # also be retrieved from the app configuration. And remove it as an
@@ -252,7 +312,9 @@ class HttpResponseController:
         return self._renderer(self)
 
     def _build_aiohttp_response(self):
-        return Response(**self.render_response())
+        resp = Response(**self.render_response())
+        resp._cookies = self._cookies
+        return resp
 
 
 class Router:
@@ -333,11 +395,13 @@ class Server:
                                                        8080)
 
     async def start(self):
-        self.server = await asyncio.ensure_future(self._server_factory)
+        self.aiohttp_server = await asyncio.ensure_future(self._server_factory)
         self.app.register('stop', self.stop)
 
     async def stop(self):
         await self.handler.finish_connections(1.0)
-        self.server.close()
-        await self.server.wait_closed()
+        if hasattr(self, 'aiohttp_server'):
+            # the HTTP server may have never started
+            self.aiohttp_server.close()
+            await self.aiohttp_server.wait_closed()
         await self.app._aiohttp_app.finish()

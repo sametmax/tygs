@@ -138,8 +138,6 @@ async def test_request_body(queued_webapp):
 
     request = response.request
 
-    await request.load_body()
-
     assert 'param' in request
     assert 'fromage' not in request
 
@@ -161,8 +159,6 @@ async def test_request_cookies(queued_webapp):
         response = await app.client.get('/')
 
         request = response.request
-
-        # await request.load_body()
 
         assert 'flavour' in request
         assert 'flavour' in request.cookies
@@ -200,12 +196,57 @@ async def test_error_handler(queued_webapp):
 
         @http.on_error('404')
         async def handler_404(req, res):
-                assert req['payload'] == 'reblochon'
-                beacon()
-                return res.text('error')
+            await req.load_body()
+            assert req['payload'] == 'reblochon'
+            beacon()
+            return res.text('error')
 
         await app.async_ready()
         await app.client.post('/fromage', data={'payload': 'reblochon'})
+        assert beacon.call_count == 1
+
+    finally:
+        await app.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_error_handler_no_load_body(queued_webapp):
+    try:
+        app = queued_webapp()
+        beacon = Mock()
+        http = app.components['http']
+
+        @http.on_error('404')
+        async def handler_404(req, res):
+            with pytest.raises(HttpRequestControllerError):
+                assert req['payload'] == 'reblochon'
+            beacon()
+            return res.text('error')
+
+        await app.async_ready()
+        await app.client.post('/fromage', data={'payload': 'reblochon'})
+        assert beacon.call_count == 1
+
+    finally:
+        await app.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_lazy_loading_controller(queued_webapp):
+    try:
+        app = queued_webapp()
+        beacon = Mock()
+        http = app.components['http']
+
+        @http.post('/', lazy_body=True)
+        async def handler_404(req, res):
+            beacon()
+            with pytest.raises(HttpRequestControllerError):
+                req['payload']
+            return res.text('error')
+
+        await app.async_ready()
+        await app.client.post('/', data={'payload': 'test'})
         assert beacon.call_count == 1
 
     finally:
@@ -237,7 +278,7 @@ async def test_error_handler_with_lazy(queued_webapp):
 @pytest.mark.asyncio
 async def test_request_browse(queued_webapp):
     try:
-        app = queued_webapp()
+        app = queued_webapp(cookies={'flavour': 'chocolate'})
         beacon = Mock()
         http = app.components['http']
 
@@ -247,26 +288,29 @@ async def test_request_browse(queued_webapp):
             with pytest.raises(HttpRequestControllerError):
                 req['nope']
             params = {}
-            for key, value in req.items():
-                params[key] = value
-            assert params == {'param': 'ok', 'data': 'yup'}
 
-            keys = []
-            for item in req:
-                keys.append(item)
-            assert keys == ['param', 'data']
+            # calling lower() on keys because CIMultiDict's implementation of
+            # case insensitive keys call .title() on all the keys
+            for key, value in req.items():
+                params[key.lower()] = value
+            assert params == {'param': 'ok', 'data': 'yup',
+                              'flavour': 'chocolate'}
+
+            keys = [key.lower() for key in req]
+            assert keys == ['param', 'data', 'flavour']
 
             values = []
             for item in req.values():
                 values.append(item)
-            assert values == ['ok', 'yup']
+            assert values == ['ok', 'yup', 'chocolate']
 
             assert 'param' in req
+            assert 'flavour' in req
 
-            assert len(req) == 2
+            assert len(req) == 3
 
             with pytest.raises(HttpRequestControllerError):
-                req.POST
+                req.POST['flavour']
 
             with pytest.raises(AttributeError):
                 req.bleh
@@ -321,3 +365,34 @@ async def test_invalid_error_handler(webapp):
         @http.on_error('200')
         async def not_error_handler(req, res):
             return res.text('Everything is awesome!')  # noqa
+
+
+@pytest.mark.asyncio
+async def test_cookie_response(queued_webapp):
+    try:
+        app = queued_webapp()
+        beacon = Mock()
+        http = app.components['http']
+
+        @http.get('/')
+        async def handler(req, res):
+
+            res.set_cookie('test', 'val')
+            res.set_cookie('test2', 'val2')
+            res.del_cookie('test2')
+
+            beacon()
+            return res.text('')
+
+        await app.async_ready()
+        res = await app.client.get('/')
+        assert beacon.call_count == 1
+        assert 'test' in res.cookies
+        assert res.cookies['test'].value == 'val'
+        assert 'max-age' not in res.cookies['test']
+        assert 'test2' in res.cookies
+        assert 'max-age' in res.cookies['test2']
+        assert res.cookies['test2']['max-age'] == 0
+
+    finally:
+        await app.async_stop()
